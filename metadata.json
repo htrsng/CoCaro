@@ -1,0 +1,5 @@
+{
+  "name": "Encircle (Bao Vây)",
+  "description": "A strategic 2-player board game inspired by Go with a unique combo mechanic: capture pieces to move again.",
+  "requestFramePermissions": []
+}

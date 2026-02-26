@@ -1,0 +1,277 @@
+import express from "express";
+import { createServer } from "http";
+import { Server } from "socket.io";
+import { createServer as createViteServer } from "vite";
+import path from "path";
+import { fileURLToPath } from "url";
+import os from "os";
+
+type Player = "X" | "O";
+type RoomPlayers = {
+  X: string | null;
+  O: string | null;
+};
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+async function startServer() {
+  const app = express();
+  const httpServer = createServer(app);
+
+  const normalizePublicBaseUrl = (url?: string | null) => {
+    if (!url) return null;
+
+    try {
+      const parsed = new URL(url);
+      parsed.hash = "";
+      return parsed.toString();
+    } catch {
+      return null;
+    }
+  };
+
+  const configuredPublicBaseUrl = normalizePublicBaseUrl(process.env.PUBLIC_BASE_URL);
+
+  const io = new Server(httpServer, {
+    cors: {
+      origin: "*",
+      methods: ["GET", "POST"]
+    }
+  });
+
+  const preferredPort = Number(process.env.PORT) || 3000;
+  let activePort = preferredPort;
+
+  const getLanIps = () => {
+    const interfaces = os.networkInterfaces();
+    const virtualAdapterPattern = /(vEthernet|hyper-v|virtual|vmware|vbox|docker|loopback|wsl|tailscale|zerotier)/i;
+    const physicalIps: string[] = [];
+    const fallbackIps: string[] = [];
+
+    const rankIp = (ip: string) => {
+      if (ip.startsWith("192.168.")) return 0;
+      if (ip.startsWith("10.")) return 1;
+
+      const secondOctet = Number(ip.split(".")[1]);
+      if (ip.startsWith("172.") && secondOctet >= 16 && secondOctet <= 31) return 2;
+
+      return 3;
+    };
+
+    const dedupeAndSort = (list: string[]) => {
+      return [...new Set(list)].sort((a, b) => rankIp(a) - rankIp(b));
+    };
+
+    for (const [adapterName, network] of Object.entries(interfaces)) {
+      if (!network) continue;
+      for (const address of network) {
+        if (address.family === "IPv4" && !address.internal) {
+          fallbackIps.push(address.address);
+
+          if (!virtualAdapterPattern.test(adapterName)) {
+            physicalIps.push(address.address);
+          }
+        }
+      }
+    }
+
+    const prioritized = dedupeAndSort(physicalIps);
+    if (prioritized.length > 0) {
+      return prioritized;
+    }
+
+    return dedupeAndSort(fallbackIps);
+  };
+
+  app.get("/api/server-info", (_req, res) => {
+    res.json({
+      port: activePort,
+      lanIps: getLanIps(),
+      publicBaseUrl: configuredPublicBaseUrl,
+    });
+  });
+
+  // Game state storage
+  const games = new Map<string, any>();
+  const roomPlayers = new Map<string, RoomPlayers>();
+
+  const getOrCreateRoomPlayers = (roomId: string) => {
+    if (!roomPlayers.has(roomId)) {
+      roomPlayers.set(roomId, { X: null, O: null });
+    }
+
+    return roomPlayers.get(roomId)!;
+  };
+
+  const getAssignedPlayer = (players: RoomPlayers, socketId: string): Player | null => {
+    if (players.X === socketId) return "X";
+    if (players.O === socketId) return "O";
+    return null;
+  };
+
+  const emitRoomSlots = (roomId: string) => {
+    const players = getOrCreateRoomPlayers(roomId);
+    io.to(roomId).emit("player-slots", {
+      X: Boolean(players.X),
+      O: Boolean(players.O),
+    });
+  };
+
+  io.on("connection", (socket) => {
+    console.log("User connected:", socket.id);
+
+    socket.on("join-room", (roomId) => {
+      socket.join(roomId);
+      console.log(`User ${socket.id} joined room ${roomId}`);
+
+      getOrCreateRoomPlayers(roomId);
+      emitRoomSlots(roomId);
+
+      // Send current state if exists
+      if (games.has(roomId)) {
+        socket.emit("game-state", games.get(roomId));
+      }
+    });
+
+    socket.on("select-player", ({ roomId, player }: { roomId: string; player: Player }) => {
+      if (player !== "X" && player !== "O") {
+        socket.emit("role-error", "Invalid player selection");
+        return;
+      }
+
+      const players = getOrCreateRoomPlayers(roomId);
+      const currentRole = getAssignedPlayer(players, socket.id);
+
+      if (currentRole && currentRole !== player) {
+        socket.emit("role-error", "You are already locked to a side");
+        socket.emit("role-assigned", currentRole);
+        return;
+      }
+
+      const slotOwner = players[player];
+      if (slotOwner && slotOwner !== socket.id) {
+        socket.emit("role-error", `Player ${player} is already taken`);
+        return;
+      }
+
+      players[player] = socket.id;
+      socket.emit("role-assigned", player);
+      emitRoomSlots(roomId);
+    });
+
+    socket.on("update-game", ({ roomId, state, player }: { roomId: string; state: any; player: Player }) => {
+      const players = getOrCreateRoomPlayers(roomId);
+      const assigned = getAssignedPlayer(players, socket.id);
+      if (!assigned || assigned !== player) {
+        socket.emit("move-rejected", "You are not allowed to play this side");
+        return;
+      }
+
+      const currentState = games.get(roomId);
+      const expectedPlayer: Player = currentState?.status?.currentPlayer ?? "X";
+      if (player !== expectedPlayer) {
+        socket.emit("move-rejected", "Not your turn");
+        return;
+      }
+
+      games.set(roomId, state);
+      socket.to(roomId).emit("game-state", state);
+    });
+
+    socket.on("reset-game", (roomId) => {
+      const players = getOrCreateRoomPlayers(roomId);
+      const assigned = getAssignedPlayer(players, socket.id);
+      if (!assigned) {
+        socket.emit("move-rejected", "Spectators cannot reset game");
+        return;
+      }
+
+      games.delete(roomId);
+      socket.to(roomId).emit("game-reset");
+    });
+
+    socket.on("disconnect", () => {
+      for (const [roomId, players] of roomPlayers.entries()) {
+        let changed = false;
+
+        if (players.X === socket.id) {
+          players.X = null;
+          changed = true;
+        }
+
+        if (players.O === socket.id) {
+          players.O = null;
+          changed = true;
+        }
+
+        if (changed) {
+          emitRoomSlots(roomId);
+        }
+      }
+
+      console.log("User disconnected:", socket.id);
+    });
+  });
+
+  if (process.env.NODE_ENV !== "production") {
+    const vite = await createViteServer({
+      server: {
+        middlewareMode: true,
+        hmr: {
+          server: httpServer,
+        },
+      },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    app.use(express.static(path.join(__dirname, "dist")));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(__dirname, "dist", "index.html"));
+    });
+  }
+
+  const listenWithPortRetry = async (startPort: number, maxAttempts = 30) => {
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const port = startPort + attempt;
+
+      const started = await new Promise<boolean>((resolve, reject) => {
+        const onError = (error: NodeJS.ErrnoException) => {
+          if (error.code === "EADDRINUSE") {
+            httpServer.off("error", onError);
+            resolve(false);
+            return;
+          }
+
+          reject(error);
+        };
+
+        httpServer.once("error", onError);
+        httpServer.listen(port, "0.0.0.0", () => {
+          httpServer.off("error", onError);
+          resolve(true);
+        });
+      });
+
+      if (started) {
+        return port;
+      }
+    }
+
+    throw new Error(`No available port found from ${startPort} to ${startPort + maxAttempts - 1}`);
+  };
+
+  activePort = await listenWithPortRetry(preferredPort);
+
+  const lanIps = getLanIps();
+  console.log(`Server running on http://localhost:${activePort}`);
+  if (configuredPublicBaseUrl) {
+    console.log(`Public URL (env): ${configuredPublicBaseUrl}`);
+  }
+  if (lanIps.length > 0) {
+    console.log(`LAN access: http://${lanIps[0]}:${activePort}`);
+  }
+}
+
+startServer();
