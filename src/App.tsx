@@ -46,8 +46,6 @@ const getRoomId = () => {
 };
 
 export default function App() {
-  const [manualPublicBaseUrl, setManualPublicBaseUrl] = useState(() => localStorage.getItem('publicBaseUrl') ?? '');
-  const [manualPublicBaseUrlInput, setManualPublicBaseUrlInput] = useState(() => localStorage.getItem('publicBaseUrl') ?? '');
   const [roomId] = useState(getRoomId);
   const [boardSize, setBoardSize] = useState(13);
   const [board, setBoard] = useState<BoardState>(createEmptyBoard(boardSize));
@@ -111,25 +109,6 @@ export default function App() {
     return url.toString();
   }, [roomId]);
 
-  const saveManualPublicBaseUrl = () => {
-    const normalized = normalizeBaseUrl(manualPublicBaseUrlInput);
-    if (!normalized) {
-      setCopyError('Public URL is invalid. Example: https://your-domain.run.app');
-      return;
-    }
-
-    setCopyError(null);
-    setManualPublicBaseUrl(normalized);
-    setManualPublicBaseUrlInput(normalized);
-    localStorage.setItem('publicBaseUrl', normalized);
-  };
-
-  const clearManualPublicBaseUrl = () => {
-    setManualPublicBaseUrl('');
-    setManualPublicBaseUrlInput('');
-    localStorage.removeItem('publicBaseUrl');
-  };
-
   const syncState = useCallback((newBoard: BoardState, newStatus: GameStatus, newPassCount: number) => {
     if (socketRef.current && myPlayer) {
       socketRef.current.emit('update-game', {
@@ -191,7 +170,7 @@ export default function App() {
 
         const data: { lanIps?: string[]; port?: number; publicBaseUrl?: string } = await response.json();
         const lanCandidates = buildInviteCandidates(data.lanIps, data.port);
-        const publicInvite = buildInviteFromBaseUrl(manualPublicBaseUrl || data.publicBaseUrl);
+        const publicInvite = buildInviteFromBaseUrl(data.publicBaseUrl);
         const candidates = publicInvite
           ? [publicInvite]
           : lanCandidates;
@@ -221,7 +200,7 @@ export default function App() {
     return () => {
       isCancelled = true;
     };
-  }, [buildInviteCandidates, buildInviteUrl, buildInviteFromBaseUrl, manualPublicBaseUrl]);
+  }, [buildInviteCandidates, buildInviteUrl, buildInviteFromBaseUrl]);
 
   const resetGameLocal = useCallback(() => {
     const newBoard = createEmptyBoard(boardSize);
@@ -424,27 +403,6 @@ export default function App() {
           <p className="hidden md:block text-[10px] font-mono uppercase tracking-widest opacity-50 text-center max-w-xl break-all">
             Share this link: {inviteUrl}
           </p>
-          <div className="w-full max-w-xl flex flex-col sm:flex-row gap-2 px-2">
-            <input
-              type="url"
-              value={manualPublicBaseUrlInput}
-              onChange={(event) => setManualPublicBaseUrlInput(event.target.value)}
-              placeholder="Paste your working public URL (https://...run.app)"
-              className="flex-1 px-3 py-2 border border-[#141414] bg-white text-[11px] font-mono"
-            />
-            <button
-              onClick={saveManualPublicBaseUrl}
-              className="px-3 py-2 border border-[#141414] hover:bg-[#141414] hover:text-[#E4E3E0] transition-colors font-mono text-[10px] uppercase tracking-widest"
-            >
-              Save URL
-            </button>
-            <button
-              onClick={clearManualPublicBaseUrl}
-              className="px-3 py-2 border border-[#141414] hover:bg-[#141414] hover:text-[#E4E3E0] transition-colors font-mono text-[10px] uppercase tracking-widest"
-            >
-              Clear
-            </button>
-          </div>
           {isLanOnlyInvite && (
             <p className="text-[10px] font-mono uppercase tracking-widest opacity-40 text-center max-w-xl">
               LAN only link: both devices must be on the same Wi-Fi/network
