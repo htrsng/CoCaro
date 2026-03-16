@@ -14,10 +14,13 @@ export interface Enclosure {
   capturedPieces: Position[];
 }
 
+export type GameOverReason = 'both-pass' | 'board-full' | 'surrender' | null;
+
 export interface GameStatus {
   currentPlayer: Player;
   isGameOver: boolean;
   winner: Player | 'Draw' | null;
+  gameOverReason: GameOverReason;
   extraTurn: boolean;
   scores: {
     X: number;

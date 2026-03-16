@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Trophy, RotateCcw, SkipForward, Info, Copy, Check } from 'lucide-react';
+import { Trophy, RotateCcw, SkipForward, Info, Copy, Check, Flag } from 'lucide-react';
 import { io, Socket } from 'socket.io-client';
 import { Board } from './components/Board';
 import {
@@ -9,9 +9,71 @@ import {
   checkCaptures,
   calculateScores
 } from './logic/gameLogic';
-import { BoardState, Player, GameStatus } from './types';
+import { BoardState, Player, GameStatus, GameOverReason } from './types';
 
 const BOARD_SIZES = [9, 13, 19, 25];
+const DEFAULT_BOARD_SIZE = 13;
+
+const getWinnerFromScores = (scores: { X: number; O: number }): Player | 'Draw' => {
+  if (scores.X > scores.O) return 'X';
+  if (scores.O > scores.X) return 'O';
+  return 'Draw';
+};
+
+const isBoardFull = (board: BoardState) => {
+  return board.every((row) => row.every((cell) => cell !== null));
+};
+
+type SyncedGameState = {
+  board: BoardState;
+  status: GameStatus;
+  passCount: number;
+  boardSize: number;
+};
+
+type SessionMatchResult = {
+  id: string;
+  matchIndex: number;
+  winner: Player | 'Draw';
+  scores: { X: number; O: number };
+  reason: Exclude<GameOverReason, null>;
+  endedAt: string;
+};
+
+const createInitialStatus = (): GameStatus => ({
+  currentPlayer: 'X',
+  isGameOver: false,
+  winner: null,
+  gameOverReason: null,
+  extraTurn: false,
+  scores: { X: 0, O: 0 },
+  lastMove: null,
+  enclosures: [],
+});
+
+const normalizeIncomingState = (state?: Partial<SyncedGameState> | null): SyncedGameState => {
+  const safeState = state ?? {};
+  const boardFromState = Array.isArray(safeState.board) ? safeState.board : [];
+  const boardLength = boardFromState.length;
+  const fallbackSize = BOARD_SIZES.includes(boardLength) ? boardLength : DEFAULT_BOARD_SIZE;
+  const candidateSize = typeof safeState.boardSize === 'number' ? safeState.boardSize : fallbackSize;
+  const boardSize = BOARD_SIZES.includes(candidateSize) ? candidateSize : fallbackSize;
+
+  const hasValidShape =
+    boardFromState.length === boardSize
+    && boardFromState.every((row) => Array.isArray(row) && row.length === boardSize);
+
+  const normalizedStatus: GameStatus = safeState.status
+    ? { ...createInitialStatus(), ...safeState.status }
+    : createInitialStatus();
+
+  return {
+    board: hasValidShape ? boardFromState : createEmptyBoard(boardSize),
+    status: normalizedStatus,
+    passCount: typeof safeState.passCount === 'number' ? safeState.passCount : 0,
+    boardSize,
+  };
+};
 
 const isPrivateIpv4 = (hostname: string) => {
   if (/^192\.168\./.test(hostname)) return true;
@@ -47,19 +109,11 @@ const getRoomId = () => {
 
 export default function App() {
   const [roomId] = useState(getRoomId);
-  const [boardSize, setBoardSize] = useState(13);
-  const [board, setBoard] = useState<BoardState>(createEmptyBoard(boardSize));
-  const [status, setStatus] = useState<GameStatus>({
-    currentPlayer: 'X',
-    isGameOver: false,
-    winner: null,
-    extraTurn: false,
-    scores: { X: 0, O: 0 },
-    lastMove: null,
-    enclosures: [],
-  });
+  const [boardSize, setBoardSize] = useState(DEFAULT_BOARD_SIZE);
+  const [board, setBoard] = useState<BoardState>(createEmptyBoard(DEFAULT_BOARD_SIZE));
+  const [status, setStatus] = useState<GameStatus>(createInitialStatus());
   const [passCount, setPassCount] = useState(0);
-  const [history, setHistory] = useState<BoardState[]>([]);
+  const [sessionResults, setSessionResults] = useState<SessionMatchResult[]>([]);
   const [myPlayer, setMyPlayer] = useState<Player | null>(null);
   const [takenSlots, setTakenSlots] = useState<{ X: boolean; O: boolean }>({ X: false, O: false });
   const [roleError, setRoleError] = useState<string | null>(null);
@@ -70,6 +124,8 @@ export default function App() {
   const [isLanOnlyInvite, setIsLanOnlyInvite] = useState(false);
 
   const socketRef = useRef<Socket | null>(null);
+  const wasGameOverRef = useRef(false);
+  const hasInitializedHistoryRef = useRef(false);
 
   const buildInviteUrl = useCallback((lanIp?: string, port?: number) => {
     const url = new URL(window.location.href);
@@ -109,15 +165,34 @@ export default function App() {
     return url.toString();
   }, [roomId]);
 
-  const syncState = useCallback((newBoard: BoardState, newStatus: GameStatus, newPassCount: number) => {
+  const applyGameState = useCallback((nextState: SyncedGameState) => {
+    setBoard(nextState.board);
+    setStatus(nextState.status);
+    setPassCount(nextState.passCount);
+    setBoardSize(nextState.boardSize);
+  }, []);
+
+  const resetGameLocal = useCallback((nextBoardSize = boardSize) => {
+    const freshState: SyncedGameState = {
+      board: createEmptyBoard(nextBoardSize),
+      status: createInitialStatus(),
+      passCount: 0,
+      boardSize: nextBoardSize,
+    };
+
+    applyGameState(freshState);
+    return freshState;
+  }, [applyGameState, boardSize]);
+
+  const syncState = useCallback((nextState: SyncedGameState) => {
     if (socketRef.current && myPlayer) {
       socketRef.current.emit('update-game', {
         roomId,
         player: myPlayer,
-        state: { board: newBoard, status: newStatus, passCount: newPassCount, boardSize }
+        state: nextState
       });
     }
-  }, [roomId, boardSize, myPlayer]);
+  }, [roomId, myPlayer]);
 
   useEffect(() => {
     socketRef.current = io();
@@ -125,15 +200,8 @@ export default function App() {
 
     socket.emit('join-room', roomId);
 
-    socket.on('game-state', (state) => {
-      setBoard(state.board);
-      setStatus(state.status);
-      setPassCount(state.passCount);
-      setBoardSize(state.boardSize);
-    });
-
-    socket.on('game-reset', () => {
-      resetGameLocal();
+    socket.on('game-state', (state?: Partial<SyncedGameState>) => {
+      applyGameState(normalizeIncomingState(state));
     });
 
     socket.on('role-assigned', (player: Player) => {
@@ -156,7 +224,7 @@ export default function App() {
     return () => {
       socket.disconnect();
     };
-  }, [roomId]);
+  }, [roomId, applyGameState]);
 
   useEffect(() => {
     let isCancelled = false;
@@ -202,27 +270,44 @@ export default function App() {
     };
   }, [buildInviteCandidates, buildInviteUrl, buildInviteFromBaseUrl]);
 
-  const resetGameLocal = useCallback(() => {
-    const newBoard = createEmptyBoard(boardSize);
-    setBoard(newBoard);
-    setStatus({
-      currentPlayer: 'X',
-      isGameOver: false,
-      winner: null,
-      extraTurn: false,
-      scores: { X: 0, O: 0 },
-      lastMove: null,
-      enclosures: [],
-    });
-    setPassCount(0);
-    setHistory([newBoard]);
-  }, [boardSize]);
+  useEffect(() => {
+    if (!hasInitializedHistoryRef.current) {
+      hasInitializedHistoryRef.current = true;
+      wasGameOverRef.current = status.isGameOver;
+      return;
+    }
 
-  const resetGame = () => {
+    const hasJustEnded = status.isGameOver && !wasGameOverRef.current;
+    if (hasJustEnded && status.winner) {
+      const reason: Exclude<GameOverReason, null> = status.gameOverReason ?? 'both-pass';
+      const endedAt = new Date().toLocaleTimeString('vi-VN', {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit'
+      });
+
+      setSessionResults((previous) => ([
+        {
+          id: `${Date.now()}-${previous.length + 1}`,
+          matchIndex: previous.length + 1,
+          winner: status.winner,
+          scores: { X: status.scores.X, O: status.scores.O },
+          reason,
+          endedAt,
+        },
+        ...previous,
+      ]));
+    }
+
+    wasGameOverRef.current = status.isGameOver;
+  }, [status.isGameOver, status.winner, status.gameOverReason, status.scores.X, status.scores.O]);
+
+  const resetGame = (nextBoardSize = boardSize) => {
     if (!myPlayer) return;
-    resetGameLocal();
+
+    const freshState = resetGameLocal(nextBoardSize);
     if (socketRef.current) {
-      socketRef.current.emit('reset-game', roomId);
+      socketRef.current.emit('reset-game', { roomId, state: freshState });
     }
   };
 
@@ -256,19 +341,37 @@ export default function App() {
     }
 
     const nextScores = calculateScores(newBoard, nextEnclosures);
-    const nextStatus: GameStatus = {
-      ...status,
-      scores: nextScores,
-      extraTurn: hasCaptured,
-      lastMove: { x, y },
-      enclosures: nextEnclosures,
-      currentPlayer: hasCaptured ? status.currentPlayer : (status.currentPlayer === 'X' ? 'O' : 'X')
-    };
+    const nextPlayer = hasCaptured ? status.currentPlayer : (status.currentPlayer === 'X' ? 'O' : 'X');
+    const boardIsFull = isBoardFull(newBoard);
+
+    const nextStatus: GameStatus = boardIsFull
+      ? {
+        ...status,
+        scores: nextScores,
+        extraTurn: false,
+        lastMove: { x, y },
+        enclosures: nextEnclosures,
+        currentPlayer: nextPlayer,
+        isGameOver: true,
+        winner: getWinnerFromScores(nextScores),
+        gameOverReason: 'board-full'
+      }
+      : {
+        ...status,
+        scores: nextScores,
+        extraTurn: hasCaptured,
+        lastMove: { x, y },
+        enclosures: nextEnclosures,
+        currentPlayer: nextPlayer,
+        isGameOver: false,
+        winner: null,
+        gameOverReason: null
+      };
 
     setBoard(newBoard);
     setStatus(nextStatus);
     setPassCount(0);
-    syncState(newBoard, nextStatus, 0);
+    syncState({ board: newBoard, status: nextStatus, passCount: 0, boardSize: newBoard.length });
   };
 
   const handlePass = () => {
@@ -280,28 +383,55 @@ export default function App() {
 
     if (nextPassCount >= 2) {
       const finalScores = calculateScores(board, status.enclosures);
-      let winner: Player | 'Draw' | null = null;
-      if (finalScores.X > finalScores.O) winner = 'X';
-      else if (finalScores.O > finalScores.X) winner = 'O';
-      else winner = 'Draw';
+      const winner = getWinnerFromScores(finalScores);
 
       nextStatus = {
         ...status,
         isGameOver: true,
         winner,
+        gameOverReason: 'both-pass',
+        extraTurn: false,
         scores: finalScores
       };
     } else {
       nextStatus = {
         ...status,
         currentPlayer: status.currentPlayer === 'X' ? 'O' : 'X',
-        extraTurn: false
+        extraTurn: false,
+        isGameOver: false,
+        winner: null,
+        gameOverReason: null
       };
     }
 
     setPassCount(nextPassCount);
     setStatus(nextStatus);
-    syncState(board, nextStatus, nextPassCount);
+    syncState({ board, status: nextStatus, passCount: nextPassCount, boardSize: board.length });
+  };
+
+  const handleSurrender = () => {
+    if (!myPlayer || status.isGameOver) return;
+
+    const winner: Player = myPlayer === 'X' ? 'O' : 'X';
+    const finalScores = calculateScores(board, status.enclosures);
+    const nextStatus: GameStatus = {
+      ...status,
+      isGameOver: true,
+      winner,
+      gameOverReason: 'surrender',
+      extraTurn: false,
+      scores: finalScores,
+    };
+
+    setStatus(nextStatus);
+
+    if (socketRef.current) {
+      socketRef.current.emit('surrender-game', {
+        roomId,
+        player: myPlayer,
+        state: { board, status: nextStatus, passCount, boardSize: board.length }
+      });
+    }
   };
 
   const copyWithFallback = (text: string) => {
@@ -344,9 +474,45 @@ export default function App() {
       }
 
       setCopied(false);
-      setCopyError('Copy failed. Please copy the Share link text manually.');
+      setCopyError('Sao chép thất bại. Vui lòng sao chép liên kết thủ công.');
     }
   };
+
+  const getResultTitle = () => {
+    if (status.winner === 'Draw') return 'Hòa!';
+    if (!status.winner) return 'Ván đấu kết thúc';
+
+    if (myPlayer) {
+      return status.winner === myPlayer ? 'Bạn thắng!' : 'Bạn thua!';
+    }
+
+    return `Người chơi ${status.winner} thắng!`;
+  };
+
+  const getResultReason = (reason: GameOverReason) => {
+    if (reason === 'board-full') return 'Bàn cờ đã kín, kết quả được tính theo điểm.';
+    if (reason === 'surrender') {
+      if (myPlayer && status.winner) {
+        return status.winner === myPlayer ? 'Đối thủ đã đầu hàng.' : 'Bạn đã đầu hàng.';
+      }
+      return 'Có người chơi đã đầu hàng.';
+    }
+    if (reason === 'both-pass') return 'Hai người chơi đã bỏ lượt liên tiếp.';
+    return null;
+  };
+
+  const getHistoryWinnerLabel = (winner: Player | 'Draw') => {
+    if (winner === 'Draw') return 'Hòa';
+    return `Người chơi ${winner} thắng`;
+  };
+
+  const getHistoryReasonLabel = (reason: Exclude<GameOverReason, null>) => {
+    if (reason === 'board-full') return 'Kết thúc do bàn cờ đã kín';
+    if (reason === 'surrender') return 'Kết thúc do đầu hàng';
+    return 'Kết thúc do bỏ lượt liên tiếp';
+  };
+
+  const resultReason = getResultReason(status.gameOverReason);
 
   return (
     <div className="min-h-screen bg-[#E4E3E0] text-[#141414] font-sans selection:bg-[#141414] selection:text-[#E4E3E0]">
@@ -358,7 +524,7 @@ export default function App() {
           </div>
           <div>
             <h1 className="text-2xl font-bold tracking-tighter uppercase italic">Encircle</h1>
-            <p className="text-[10px] font-mono opacity-50 uppercase tracking-widest">Online Multiplayer // Room: {roomId}</p>
+            <p className="text-[10px] font-mono opacity-50 uppercase tracking-widest">Chơi mạng // Phòng: {roomId}</p>
           </div>
         </div>
 
@@ -368,7 +534,7 @@ export default function App() {
             className="flex items-center gap-2 px-4 py-2 border border-[#141414] hover:bg-[#141414] hover:text-[#E4E3E0] transition-colors font-mono text-[10px] uppercase tracking-widest"
           >
             {copied ? <Check size={14} /> : <Copy size={14} />}
-            {copied ? 'Copied!' : 'Invite Friend'}
+            {copied ? 'Đã sao chép!' : 'Mời bạn'}
           </button>
           <button
             onClick={resetGame}
@@ -380,7 +546,7 @@ export default function App() {
       </header>
 
       <header className="md:hidden border-b border-[#141414] px-3 py-3 flex items-center justify-between bg-white/70 backdrop-blur-sm sticky top-0 z-50">
-        <p className="text-[10px] font-mono uppercase tracking-widest opacity-60">Room: {roomId}</p>
+        <p className="text-[10px] font-mono uppercase tracking-widest opacity-60">Phòng: {roomId}</p>
         <div className="flex gap-2">
           <button
             onClick={copyLink}
@@ -401,16 +567,16 @@ export default function App() {
         {/* Game Board Section */}
         <div className="flex flex-col items-center justify-center space-y-4 lg:space-y-8">
           <p className="hidden md:block text-[10px] font-mono uppercase tracking-widest opacity-50 text-center max-w-xl break-all">
-            Share this link: {inviteUrl}
+            Chia sẻ liên kết: {inviteUrl}
           </p>
           {isLanOnlyInvite && (
             <p className="text-[10px] font-mono uppercase tracking-widest opacity-40 text-center max-w-xl">
-              LAN only link: both devices must be on the same Wi-Fi/network
+              Liên kết nội bộ LAN: cả hai thiết bị phải cùng mạng Wi-Fi/LAN
             </p>
           )}
           {inviteCandidates.length > 1 && (
             <p className="text-[10px] font-mono uppercase tracking-widest opacity-40 text-center max-w-xl break-all">
-              Backup links: {inviteCandidates.slice(1).join(' | ')}
+              Liên kết dự phòng: {inviteCandidates.slice(1).join(' | ')}
             </p>
           )}
           {copyError && (
@@ -420,29 +586,29 @@ export default function App() {
           )}
 
           {/* Role Selection */}
-          {!myPlayer && !status.isGameOver && (
+          {!myPlayer && (
             <div className="bg-white p-4 md:p-6 border border-[#141414] shadow-[4px_4px_0px_0px_rgba(20,20,20,1)] text-center w-full max-w-sm">
-              <p className="text-[10px] font-mono uppercase tracking-widest opacity-60 mb-4">Select Your Side</p>
+              <p className="text-[10px] font-mono uppercase tracking-widest opacity-60 mb-4">Chọn vai của bạn</p>
               <div className="flex gap-4">
                 <button
                   onClick={() => requestPlayer('X')}
                   disabled={takenSlots.X}
                   className="flex-1 py-3 border border-[#141414] hover:bg-[#141414] hover:text-white transition-colors font-bold disabled:opacity-40"
                 >
-                  {takenSlots.X ? 'X Taken' : 'Play as X'}
+                  {takenSlots.X ? 'X đã có người chọn' : 'Chơi vai X'}
                 </button>
                 <button
                   onClick={() => requestPlayer('O')}
                   disabled={takenSlots.O}
                   className="flex-1 py-3 border border-[#141414] hover:bg-[#141414] hover:text-white transition-colors font-bold disabled:opacity-40"
                 >
-                  {takenSlots.O ? 'O Taken' : 'Play as O'}
+                  {takenSlots.O ? 'O đã có người chọn' : 'Chơi vai O'}
                 </button>
               </div>
               {roleError && (
                 <p className="mt-3 text-[10px] font-mono uppercase tracking-widest text-red-600">{roleError}</p>
               )}
-              <p className="mt-4 text-[9px] opacity-40 uppercase tracking-tighter italic">Spectating until you select a side</p>
+              <p className="mt-4 text-[9px] opacity-40 uppercase tracking-tighter italic">Bạn đang xem cho đến khi chọn vai</p>
             </div>
           )}
 
@@ -456,23 +622,26 @@ export default function App() {
               >
                 <Trophy className="mx-auto mb-4 text-yellow-500" size={48} />
                 <h2 className="text-2xl md:text-4xl font-bold italic uppercase mb-2">
-                  {status.winner === 'Draw' ? "It's a Draw!" : `${status.winner} Wins!`}
+                  {getResultTitle()}
                 </h2>
-                <p className="font-mono text-sm opacity-60 mb-6">Final Score: X {status.scores.X} - O {status.scores.O}</p>
+                {resultReason && (
+                  <p className="font-mono text-xs uppercase tracking-widest opacity-60 mb-2">{resultReason}</p>
+                )}
+                <p className="font-mono text-sm opacity-60 mb-6">Tỷ số cuối: X {status.scores.X} - O {status.scores.O}</p>
                 <button
                   onClick={resetGame}
                   className="w-full py-3 bg-[#E4E3E0] text-[#141414] font-bold uppercase tracking-widest hover:bg-white transition-colors"
                 >
-                  New Game
+                  Ván mới
                 </button>
               </motion.div>
             ) : (
               <div className="relative">
                 <div className="md:hidden mb-2 text-center font-mono text-[10px] uppercase tracking-widest opacity-60">
-                  <span className={status.currentPlayer === 'X' ? 'font-bold text-blue-700' : ''}>Player X</span>
-                  <span className="mx-2">vs</span>
-                  <span className={status.currentPlayer === 'O' ? 'font-bold text-red-600' : ''}>Player O</span>
-                  {status.extraTurn && <span className="block mt-1 text-emerald-600 font-bold">Combo! Extra Turn</span>}
+                  <span className={status.currentPlayer === 'X' ? 'font-bold text-blue-700' : ''}>Người chơi X</span>
+                  <span className="mx-2">đấu</span>
+                  <span className={status.currentPlayer === 'O' ? 'font-bold text-red-600' : ''}>Người chơi O</span>
+                  {status.extraTurn && <span className="block mt-1 text-emerald-600 font-bold">Combo! Thêm lượt</span>}
                 </div>
 
                 <Board
@@ -485,22 +654,22 @@ export default function App() {
 
                 <div className="hidden md:flex absolute -top-6 left-0 right-0 justify-between px-2 font-mono text-[10px] uppercase tracking-widest opacity-50">
                   <div className="flex items-center gap-2">
-                    <span className={status.currentPlayer === 'X' ? 'font-bold text-blue-700' : ''}>Player X</span>
-                    <span>vs</span>
-                    <span className={status.currentPlayer === 'O' ? 'font-bold text-red-600' : ''}>Player O</span>
+                    <span className={status.currentPlayer === 'X' ? 'font-bold text-blue-700' : ''}>Người chơi X</span>
+                    <span>đấu</span>
+                    <span className={status.currentPlayer === 'O' ? 'font-bold text-red-600' : ''}>Người chơi O</span>
                   </div>
-                  {status.extraTurn && <span className="text-emerald-600 font-bold">Combo! Extra Turn</span>}
+                  {status.extraTurn && <span className="text-emerald-600 font-bold">Combo! Thêm lượt</span>}
                 </div>
 
                 {myPlayer && (
                   <div className="hidden md:block absolute -bottom-6 left-0 right-0 text-center font-mono text-[10px] uppercase tracking-widest opacity-50">
-                    You are playing as <span className="font-bold underline">{myPlayer}</span>
+                    Bạn đang chơi vai <span className="font-bold underline">{myPlayer}</span>
                   </div>
                 )}
 
                 {myPlayer && (
                   <div className="md:hidden mt-2 text-center font-mono text-[10px] uppercase tracking-widest opacity-50">
-                    You are playing as <span className="font-bold underline">{myPlayer}</span>
+                    Bạn đang chơi vai <span className="font-bold underline">{myPlayer}</span>
                   </div>
                 )}
               </div>
@@ -513,7 +682,14 @@ export default function App() {
               disabled={!myPlayer || status.currentPlayer !== myPlayer}
               className="w-full md:w-auto justify-center px-6 py-3 md:py-2 border border-[#141414] flex items-center gap-2 hover:bg-[#141414] hover:text-[#E4E3E0] transition-colors font-mono text-xs uppercase tracking-widest disabled:opacity-30"
             >
-              <SkipForward size={16} /> Pass Turn
+              <SkipForward size={16} /> Bỏ lượt
+            </button>
+            <button
+              onClick={handleSurrender}
+              disabled={!myPlayer || status.isGameOver}
+              className="w-full md:w-auto justify-center px-6 py-3 md:py-2 border border-red-700 text-red-700 flex items-center gap-2 hover:bg-red-700 hover:text-white transition-colors font-mono text-xs uppercase tracking-widest disabled:opacity-30"
+            >
+              <Flag size={16} /> Đầu hàng
             </button>
           </div>
         </div>
@@ -521,14 +697,14 @@ export default function App() {
         {/* Sidebar Info Section */}
         <aside className="hidden lg:block space-y-8">
           <section className="bg-white p-6 border border-[#141414] shadow-[4px_4px_0px_0px_rgba(20,20,20,1)]">
-            <h3 className="font-serif italic text-xs uppercase opacity-50 mb-4 border-b border-[#141414]/10 pb-2">Live Statistics</h3>
+            <h3 className="font-serif italic text-xs uppercase opacity-50 mb-4 border-b border-[#141414]/10 pb-2">Thống kê trực tiếp</h3>
             <div className="grid grid-cols-2 gap-4">
               <div className={`p-4 border ${status.currentPlayer === 'X' ? 'border-[#141414] bg-[#141414] text-white' : 'border-[#141414]/10'}`}>
-                <p className="text-[10px] font-mono uppercase tracking-widest opacity-60">Player X</p>
+                <p className="text-[10px] font-mono uppercase tracking-widest opacity-60">Người chơi X</p>
                 <p className="text-3xl font-bold font-mono">{status.scores.X}</p>
               </div>
               <div className={`p-4 border ${status.currentPlayer === 'O' ? 'border-[#141414] bg-[#141414] text-white' : 'border-[#141414]/10'}`}>
-                <p className="text-[10px] font-mono uppercase tracking-widest opacity-60">Player O</p>
+                <p className="text-[10px] font-mono uppercase tracking-widest opacity-60">Người chơi O</p>
                 <p className="text-3xl font-bold font-mono">{status.scores.O}</p>
               </div>
             </div>
@@ -536,20 +712,17 @@ export default function App() {
 
           <section className="bg-white p-6 border border-[#141414] shadow-[4px_4px_0px_0px_rgba(20,20,20,1)]">
             <h3 className="font-serif italic text-xs uppercase opacity-50 mb-4 border-b border-[#141414]/10 pb-2 flex items-center gap-2">
-              <Info size={14} /> Game Rules & Settings
+              <Info size={14} /> Luật chơi và cài đặt
             </h3>
 
             <div className="space-y-4">
               <div>
-                <label className="text-[10px] font-mono uppercase tracking-widest opacity-60 block mb-2">Board Size</label>
+                <label className="text-[10px] font-mono uppercase tracking-widest opacity-60 block mb-2">Kích thước bàn cờ</label>
                 <div className="flex gap-2">
                   {BOARD_SIZES.map(size => (
                     <button
                       key={size}
-                      onClick={() => {
-                        setBoardSize(size);
-                        resetGame();
-                      }}
+                      onClick={() => resetGame(size)}
                       className={`flex-1 py-2 text-xs font-mono border border-[#141414] transition-colors ${boardSize === size ? 'bg-[#141414] text-white' : 'hover:bg-[#141414]/5'}`}
                     >
                       {size}x{size}
@@ -559,22 +732,46 @@ export default function App() {
               </div>
 
               <div className="text-[11px] leading-relaxed space-y-2 opacity-80">
-                <p>• Surround opponent pieces to capture them.</p>
-                <p>• <span className="font-bold text-emerald-600">COMBO:</span> Capturing pieces grants an immediate extra turn.</p>
-                <p>• Suicide moves are prohibited unless they result in a capture.</p>
-                <p>• Game ends when both players pass or board is full.</p>
+                <p>• Bao vây quân đối thủ để bắt quân.</p>
+                <p>• <span className="font-bold text-emerald-600">COMBO:</span> Bắt quân sẽ được thêm một lượt ngay lập tức.</p>
+                <p>• Không được tự sát, trừ khi nước đi đó bắt được quân.</p>
+                <p>• Ván đấu kết thúc khi cả hai cùng bỏ lượt hoặc bàn cờ đã kín.</p>
               </div>
             </div>
+          </section>
+
+          <section className="bg-white p-6 border border-[#141414] shadow-[4px_4px_0px_0px_rgba(20,20,20,1)]">
+            <h3 className="font-serif italic text-xs uppercase opacity-50 mb-4 border-b border-[#141414]/10 pb-2">Lịch sử ván trong phiên</h3>
+            <p className="text-[10px] font-mono uppercase tracking-widest opacity-40 mb-4">
+              Chỉ lưu trong phiên mở link hiện tại. Tải lại hoặc đóng tab sẽ mất.
+            </p>
+
+            {sessionResults.length === 0 ? (
+              <p className="text-[11px] opacity-60">Chưa có kết quả nào trong phiên này.</p>
+            ) : (
+              <div className="space-y-3 max-h-[280px] overflow-y-auto pr-1">
+                {sessionResults.map((result) => (
+                  <div key={result.id} className="border border-[#141414]/15 p-3">
+                    <p className="text-[10px] font-mono uppercase tracking-widest opacity-50 mb-1">
+                      Ván {result.matchIndex} • {result.endedAt}
+                    </p>
+                    <p className="text-sm font-semibold">{getHistoryWinnerLabel(result.winner)}</p>
+                    <p className="text-[11px] font-mono opacity-70">Tỷ số: X {result.scores.X} - O {result.scores.O}</p>
+                    <p className="text-[10px] opacity-55">{getHistoryReasonLabel(result.reason)}</p>
+                  </div>
+                ))}
+              </div>
+            )}
           </section>
         </aside>
       </main>
 
       <footer className="hidden lg:block border-t border-[#141414] p-8 mt-12 bg-white/50 backdrop-blur-sm">
         <div className="max-w-7xl mx-auto flex flex-col md:flex-row justify-between items-center gap-4">
-          <p className="text-[10px] font-mono uppercase tracking-widest opacity-50">© 2026 Encircle Strategy Lab // All Rights Reserved</p>
+          <p className="text-[10px] font-mono uppercase tracking-widest opacity-50">© 2026 Encircle Strategy Lab // Bảo lưu mọi quyền</p>
           <div className="flex gap-8">
-            <a href="#" className="text-[10px] font-mono uppercase tracking-widest hover:underline">Documentation</a>
-            <a href="#" className="text-[10px] font-mono uppercase tracking-widest hover:underline">Strategy Guide</a>
+            <a href="#" className="text-[10px] font-mono uppercase tracking-widest hover:underline">Tài liệu</a>
+            <a href="#" className="text-[10px] font-mono uppercase tracking-widest hover:underline">Hướng dẫn chiến thuật</a>
           </div>
         </div>
       </footer>

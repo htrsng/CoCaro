@@ -12,6 +12,13 @@ type RoomPlayers = {
   O: string | null;
 };
 
+type GameState = {
+  board: any;
+  status: any;
+  passCount: number;
+  boardSize: number;
+};
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -93,7 +100,7 @@ async function startServer() {
   });
 
   // Game state storage
-  const games = new Map<string, any>();
+  const games = new Map<string, GameState>();
   const roomPlayers = new Map<string, RoomPlayers>();
 
   const getOrCreateRoomPlayers = (roomId: string) => {
@@ -110,8 +117,27 @@ async function startServer() {
     return null;
   };
 
-  const emitRoomSlots = (roomId: string) => {
+  const isSocketStillInRoom = (roomId: string, socketId: string) => {
+    const connectedSocket = io.sockets.sockets.get(socketId);
+    return Boolean(connectedSocket && connectedSocket.rooms.has(roomId));
+  };
+
+  const normalizeRoomPlayers = (roomId: string) => {
     const players = getOrCreateRoomPlayers(roomId);
+
+    if (players.X && !isSocketStillInRoom(roomId, players.X)) {
+      players.X = null;
+    }
+
+    if (players.O && !isSocketStillInRoom(roomId, players.O)) {
+      players.O = null;
+    }
+
+    return players;
+  };
+
+  const emitRoomSlots = (roomId: string) => {
+    const players = normalizeRoomPlayers(roomId);
     io.to(roomId).emit("player-slots", {
       X: Boolean(players.X),
       O: Boolean(players.O),
@@ -125,7 +151,7 @@ async function startServer() {
       socket.join(roomId);
       console.log(`User ${socket.id} joined room ${roomId}`);
 
-      getOrCreateRoomPlayers(roomId);
+      normalizeRoomPlayers(roomId);
       emitRoomSlots(roomId);
 
       // Send current state if exists
@@ -136,22 +162,22 @@ async function startServer() {
 
     socket.on("select-player", ({ roomId, player }: { roomId: string; player: Player }) => {
       if (player !== "X" && player !== "O") {
-        socket.emit("role-error", "Invalid player selection");
+        socket.emit("role-error", "Lựa chọn vai không hợp lệ");
         return;
       }
 
-      const players = getOrCreateRoomPlayers(roomId);
+      const players = normalizeRoomPlayers(roomId);
       const currentRole = getAssignedPlayer(players, socket.id);
 
       if (currentRole && currentRole !== player) {
-        socket.emit("role-error", "You are already locked to a side");
+        socket.emit("role-error", "Bạn đã khóa vai trước đó");
         socket.emit("role-assigned", currentRole);
         return;
       }
 
       const slotOwner = players[player];
       if (slotOwner && slotOwner !== socket.id) {
-        socket.emit("role-error", `Player ${player} is already taken`);
+        socket.emit("role-error", `Vai ${player} đã có người chọn`);
         return;
       }
 
@@ -160,18 +186,18 @@ async function startServer() {
       emitRoomSlots(roomId);
     });
 
-    socket.on("update-game", ({ roomId, state, player }: { roomId: string; state: any; player: Player }) => {
-      const players = getOrCreateRoomPlayers(roomId);
+    socket.on("update-game", ({ roomId, state, player }: { roomId: string; state: GameState; player: Player }) => {
+      const players = normalizeRoomPlayers(roomId);
       const assigned = getAssignedPlayer(players, socket.id);
       if (!assigned || assigned !== player) {
-        socket.emit("move-rejected", "You are not allowed to play this side");
+        socket.emit("move-rejected", "Bạn không có quyền đánh cho vai này");
         return;
       }
 
       const currentState = games.get(roomId);
       const expectedPlayer: Player = currentState?.status?.currentPlayer ?? "X";
       if (player !== expectedPlayer) {
-        socket.emit("move-rejected", "Not your turn");
+        socket.emit("move-rejected", "Chưa đến lượt của bạn");
         return;
       }
 
@@ -179,16 +205,42 @@ async function startServer() {
       socket.to(roomId).emit("game-state", state);
     });
 
-    socket.on("reset-game", (roomId) => {
-      const players = getOrCreateRoomPlayers(roomId);
+    socket.on("reset-game", (payload: string | { roomId: string; state?: GameState }) => {
+      const roomId = typeof payload === "string" ? payload : payload.roomId;
+      if (!roomId) {
+        socket.emit("move-rejected", "Mã phòng không hợp lệ");
+        return;
+      }
+
+      const players = normalizeRoomPlayers(roomId);
       const assigned = getAssignedPlayer(players, socket.id);
       if (!assigned) {
-        socket.emit("move-rejected", "Spectators cannot reset game");
+        socket.emit("move-rejected", "Người xem không thể bắt đầu ván mới");
+        return;
+      }
+
+      const nextState = typeof payload === "string" ? undefined : payload.state;
+
+      if (nextState) {
+        games.set(roomId, nextState);
+        io.to(roomId).emit("game-state", nextState);
         return;
       }
 
       games.delete(roomId);
-      socket.to(roomId).emit("game-reset");
+      io.to(roomId).emit("game-reset");
+    });
+
+    socket.on("surrender-game", ({ roomId, player, state }: { roomId: string; player: Player; state: GameState }) => {
+      const players = normalizeRoomPlayers(roomId);
+      const assigned = getAssignedPlayer(players, socket.id);
+      if (!assigned || assigned !== player) {
+        socket.emit("move-rejected", "Bạn không có quyền đầu hàng cho vai này");
+        return;
+      }
+
+      games.set(roomId, state);
+      io.to(roomId).emit("game-state", state);
     });
 
     socket.on("disconnect", () => {
